@@ -6,6 +6,8 @@
 |---|---|
 | [`kezekshi`](kezekshi/SKILL.md) | Чаттан түскен өтінішті қадаммен өңдейді: қабылдау → қайталау (браузер арқылы да) → диагностика → шешім мен жауап → Jira/білім қоры → журнал және кешкі дейли-репорт |
 | [`bag-jira`](bag-jira/SKILL.md) | Багты ауқымымен, қадамдарымен және дәлелімен Jira тапсырмасына айналдырады |
+| [`tg`](tg/SKILL.md) | `/tg`: чаттағы өтінішті жеке Telegram-ботқа пересылка жасайсың — ол Claude сессиясына түседі (мәтін, фото, файл) |
+| [`datagrip-readonly`](datagrip-readonly/SKILL.md) | DataGrip MCP арқылы базаны тек оқу ережесі: INSERT/UPDATE/DELETE жібермейді, SQL-ды кезекшіге дайындап береді |
 
 Сессияда қорғауға арналған черновик: [docs/strat-session-draft.md](docs/strat-session-draft.md).
 
@@ -15,6 +17,14 @@
 git clone <осы репо>
 ln -s "$(pwd)/kezekshi-skills/kezekshi" ~/.claude/skills/kezekshi
 ln -s "$(pwd)/kezekshi-skills/bag-jira" ~/.claude/skills/bag-jira
+ln -s "$(pwd)/kezekshi-skills/tg" ~/.claude/skills/tg
+ln -s "$(pwd)/kezekshi-skills/datagrip-readonly" ~/.claude/skills/datagrip-readonly
+```
+
+Telegram-ботты бір рет баптау (токенді тек өзің енгізесің, ол `~/.claude/tg-inbox/`-те сақталады, репода емес):
+
+```bash
+python3 ~/.claude/skills/tg/tg_inbox.py setup
 ```
 
 Claude Code-ты қайта аш — скиллдер тізімде шығады.
