@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Бэкенд логтарын Kibana (Elasticsearch) арқылы іздеу. Тек оқу.
+"""Бэкенд логтарын іздеу. Тек оқу.
 
-Kibana мекенжайы KIBANA_URL ортасының айнымалысынан алынады (мысалы http://<kibana-host>:5601).
-Kibana-да авторизация қосылса, KIBANA_AUTH="Basic ..." немесе "ApiKey ..." беріледі.
+Екі жол (бірінші қолжетімдісі қолданылады):
+  1. juz40-vpn-logs сервисі — VPN керек емес, кезекшілерге ыңғайлы:
+       LOGS_SERVICE_URL=https://<logs-host>  LOGS_SERVICE_TOKEN=<bearer токен>
+  2. Kibana тікелей — VPN керек:
+       KIBANA_URL=http://<kibana-host>:5601  [KIBANA_AUTH="Basic ..." | "ApiKey ..."]
 
 Мысалдар:
   logs.py --check
@@ -48,30 +51,32 @@ def die(msg, code=1):
     sys.exit(code)
 
 
-def kibana_url():
-    url = os.environ.get("KIBANA_URL", "").rstrip("/")
-    if not url:
-        die("KIBANA_URL берілмеген. Мысалы: export KIBANA_URL=http://<kibana-host>:5601 (VPN қосулы болсын)", 3)
-    return url
+def backend():
+    if os.environ.get("LOGS_SERVICE_URL") and os.environ.get("LOGS_SERVICE_TOKEN"):
+        return "service"
+    if os.environ.get("KIBANA_URL"):
+        return "kibana"
+    die("Логтарға жол берілмеген. Не LOGS_SERVICE_URL + LOGS_SERVICE_TOKEN (juz40-vpn-logs), "
+        "не KIBANA_URL (VPN қосулы болсын) керек.", 3)
 
 
-def request(method, path, body=None):
-    headers = {"kbn-xsrf": "true", "Content-Type": "application/json"}
-    auth = os.environ.get("KIBANA_AUTH")
-    if auth:
-        headers["Authorization"] = auth
+def http(method, url, headers, body=None):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(kibana_url() + path, data=data, headers=headers, method=method)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            die(f"Kibana рұқсат бермеді ({e.code}). KIBANA_AUTH керек — әзірлеушіге/DevOps-қа жүгініңіз.", 4)
-        die(f"Kibana қатесі {e.code}: {e.read()[:300]!r}", 1)
+            die(f"Логтар рұқсат бермеді ({e.code}): токен/рұқсат керек — әзірлеушіге/DevOps-қа жүгініңіз.", 4)
+        if e.code in (502, 503):
+            die("Лог сервисі Elasticsearch-ке жете алмады (VPN туннелі түсіп қалған болуы мүмкін).", 2)
+        die(f"Логтар қатесі {e.code}: {e.read()[:300]!r}", 1)
     except OSError as e:
-        die(f"Kibana-ға қосылу мүмкін болмады ({e}). VPN қосулы ма?", 2)
+        die(f"Логтарға қосылу мүмкін болмады ({e}). VPN/сервис қолжетімді ме?", 2)
 
+
+# ---------- уақыт ----------
 
 def parse_since(value):
     m = re.fullmatch(r"(\d+)([mhd])", value)
@@ -94,17 +99,21 @@ def time_range(args):
     return now - since, now
 
 
-def build_query(args):
-    start, end = time_range(args)
+# ---------- Kibana ----------
+
+def kibana_request(method, path, body=None):
+    headers = {"kbn-xsrf": "true", "Content-Type": "application/json"}
+    if os.environ.get("KIBANA_AUTH"):
+        headers["Authorization"] = os.environ["KIBANA_AUTH"]
+    return http(method, os.environ["KIBANA_URL"].rstrip("/") + path, headers, body)
+
+
+def kibana_search(args, start, end):
     filters = [{"range": {"@timestamp": {"gte": start.isoformat(), "lte": end.isoformat()}}}]
-    if args.request_id:
-        filters.append({"match_phrase": {"parsed_json.requestId": args.request_id}})
-    if args.user:
-        filters.append({"match_phrase": {"parsed_json.username": args.user}})
-    if args.mapping:
-        filters.append({"match_phrase": {"parsed_json.requestMapping": args.mapping}})
-    if args.text:
-        filters.append({"match_phrase": {"parsed_json.message": args.text}})
+    for value, field in ((args.request_id, "requestId"), (args.user, "username"),
+                         (args.mapping, "requestMapping"), (args.text, "message")):
+        if value:
+            filters.append({"match_phrase": {f"parsed_json.{field}": value}})
     query = {"bool": {"filter": filters}}
     if args.errors:
         query["bool"]["should"] = [
@@ -112,37 +121,84 @@ def build_query(args):
             {"terms": {"parsed_json.level": ["ERROR", "WARN", "error", "warn"]}},
         ]
         query["bool"]["minimum_should_match"] = 1
-    return {
-        "size": args.size,
-        "sort": [{"@timestamp": {"order": "desc"}}],
-        "track_total_hits": True,
-        "query": query,
-        "_source": SAFE_FIELDS,
-    }, start, end
+    body = {"size": args.size, "sort": [{"@timestamp": {"order": "desc"}}], "track_total_hits": True,
+            "query": query, "_source": SAFE_FIELDS}
+    path = "/api/console/proxy?" + urllib.parse.urlencode({"path": f"{INDEX}/_search", "method": "POST"})
+    res = kibana_request("POST", path, body)
+    hits = []
+    for h in res.get("hits", {}).get("hits", []):
+        src = h.get("_source", {})
+        pj = src.get("parsed_json") or {}
+        hits.append({
+            "timestamp": src.get("@timestamp"),
+            "level": pj.get("level"),
+            "status": pj.get("responseStatusCode"),
+            "method": pj.get("requestHttpMethod"),
+            "uri": pj.get("requestMapping") or pj.get("requestUri"),
+            "username": pj.get("username"),
+            "duration": pj.get("duration"),
+            "requestId": pj.get("requestId"),
+            "message": pj.get("message"),
+        })
+    return res.get("hits", {}).get("total", {}).get("value", len(hits)), hits
 
+
+# ---------- juz40-vpn-logs ----------
+
+def qs_quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def service_search(args, start, end):
+    parts = []
+    for value, field in ((args.request_id, "requestId"), (args.user, "username"),
+                         (args.mapping, "requestMapping"), (args.text, "message")):
+        if value:
+            parts.append(f"parsed_json.{field}:{qs_quote(value)}")
+    if args.errors:
+        parts.append("(parsed_json.responseStatusCode:>=400 OR parsed_json.level:(ERROR OR WARN))")
+    params = {"q": " AND ".join(parts), "from": start.isoformat(), "to": end.isoformat(), "size": str(args.size)}
+    url = os.environ["LOGS_SERVICE_URL"].rstrip("/") + "/logs/search?" + urllib.parse.urlencode(params)
+    res = http("GET", url, {"Authorization": f"Bearer {os.environ['LOGS_SERVICE_TOKEN']}"})
+    if not isinstance(res, dict) or not isinstance(res.get("hits"), list):
+        die("Лог сервисі күтпеген формат қайтарды.", 1)
+    hits = [{
+        "timestamp": h.get("timestamp"),
+        "level": None,
+        "status": h.get("status"),
+        "method": h.get("method"),
+        "uri": h.get("uri"),
+        "username": h.get("username"),
+        "duration": None,
+        "requestId": h.get("requestId"),
+        "message": h.get("message"),
+    } for h in res["hits"]]  # raw өрісі әдейі алынбайды — онда сұраныс денесі болуы мүмкін
+    return res.get("total", len(hits)), hits
+
+
+# ---------- шығару ----------
 
 def mask(text):
     return SECRET_RE.sub(lambda m: m.group(1) + "***", text)
 
 
-def fmt_hit(src):
-    pj = src.get("parsed_json", {}) or {}
-    ts = src.get("@timestamp", "")
+def fmt_hit(h):
+    ts = h.get("timestamp") or ""
     try:
         ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(ALMATY).strftime("%d.%m %H:%M:%S")
     except ValueError:
         pass
-    msg = " ".join(str(pj.get("message", "")).split())
+    msg = " ".join(str(h.get("message") or "").split())
     if msg == "Request info":
         msg = ""
     parts = [
         ts,
-        str(pj.get("level", "")),
-        str(pj.get("responseStatusCode", "")),
-        f'{pj.get("requestHttpMethod", "")} {pj.get("requestMapping") or pj.get("requestUri") or ""}'.strip(),
-        f'user={pj.get("username")}' if pj.get("username") else "",
-        f'{pj.get("duration")}ms' if pj.get("duration") is not None else "",
-        f'req={pj.get("requestId")}' if pj.get("requestId") else "",
+        str(h.get("level") or ""),
+        str(h.get("status") or ""),
+        f'{h.get("method") or ""} {h.get("uri") or ""}'.strip(),
+        f'user={h["username"]}' if h.get("username") else "",
+        f'{h["duration"]}ms' if h.get("duration") is not None else "",
+        f'req={h["requestId"]}' if h.get("requestId") else "",
         mask(msg[:300]),
     ]
     return " | ".join(p for p in parts if p)
@@ -150,7 +206,7 @@ def fmt_hit(src):
 
 def main():
     p = argparse.ArgumentParser(description="Бэкенд логтарын іздеу (тек оқу)")
-    p.add_argument("--check", action="store_true", help="Kibana қолжетімді ме")
+    p.add_argument("--check", action="store_true", help="логтар қолжетімді ме")
     p.add_argument("--request-id")
     p.add_argument("--user", help="username / почта")
     p.add_argument("--mapping", help='endpoint үлгісі, мысалы "/v1/unts/{id}/start"')
@@ -159,44 +215,43 @@ def main():
     p.add_argument("--minutes", type=int, default=15, help="--at айналасындағы терезе (±мин)")
     p.add_argument("--since", help="соңғы кезең: 30m, 2h, 3d (әдепкі 24h, request-id үшін 7d)")
     p.add_argument("--errors", action="store_true", help="тек 4xx/5xx және ERROR/WARN")
-    p.add_argument("--count-users", action="store_true", help="қанша бөлек пайдаланушы")
+    p.add_argument("--count-users", action="store_true", help="қанша бөлек пайдаланушы (почталарсыз)")
     p.add_argument("--size", type=int, default=30)
     args = p.parse_args()
+    mode = backend()
 
     if args.check:
-        st = request("GET", "/api/status")
-        print(f'OK: {st.get("name")} {st.get("version", {}).get("number")}')
+        if mode == "service":
+            res = http("GET", os.environ["LOGS_SERVICE_URL"].rstrip("/") + "/health", {})
+            print(f"OK (juz40-vpn-logs): {json.dumps(res, ensure_ascii=False)[:200]}")
+        else:
+            st = kibana_request("GET", "/api/status")
+            print(f'OK (Kibana): {st.get("name")} {st.get("version", {}).get("number")}')
         return
     if not (args.request_id or args.user or args.mapping or args.text):
         die("Кемінде біреуі керек: --request-id, --user, --mapping немесе --text")
     if args.count_users:
         args.size = max(args.size, 500)
 
-    body, start, end = build_query(args)
-    path = "/api/console/proxy?" + urllib.parse.urlencode({"path": f"{INDEX}/_search", "method": "POST"})
-    res = request("POST", path, body)
-    hits = res.get("hits", {}).get("hits", [])
-    total = res.get("hits", {}).get("total", {}).get("value", len(hits))
+    start, end = time_range(args)
+    total, hits = (service_search if mode == "service" else kibana_search)(args, start, end)
+    period = f"{start.astimezone(ALMATY):%d.%m %H:%M} — {end.astimezone(ALMATY):%d.%m %H:%M}"
 
     if args.count_users:
         # Ауқымды бағалау: тек сандар, басқа пайдаланушылардың почталары шығарылмайды.
-        users = {(h.get("_source", {}).get("parsed_json") or {}).get("username") for h in hits}
-        users -= {None, "", "anonymousUser"}
+        users = {h.get("username") for h in hits} - {None, "", "anonymousUser"}
         statuses = {}
         for h in hits:
-            code = (h.get("_source", {}).get("parsed_json") or {}).get("responseStatusCode")
-            if code is not None:
-                statuses[code] = statuses.get(code, 0) + 1
-        print(f"Кезең (Алматы): {start.astimezone(ALMATY):%d.%m %H:%M} — {end.astimezone(ALMATY):%d.%m %H:%M}; "
-              f"жазба: {total}")
+            if h.get("status") is not None:
+                statuses[h["status"]] = statuses.get(h["status"], 0) + 1
+        print(f"Кезең (Алматы): {period}; жазба: {total}")
         print(f"Бөлек пайдаланушылар (алғашқы {len(hits)} жазба бойынша): {len(users)}")
-        print("Статустар: " + ", ".join(f"{k}: {v}" for k, v in sorted(statuses.items())))
+        print("Статустар: " + ", ".join(f"{k}: {v}" for k, v in sorted(statuses.items(), key=str)))
         return
 
-    print(f"Кезең (Алматы): {start.astimezone(ALMATY):%d.%m %H:%M} — {end.astimezone(ALMATY):%d.%m %H:%M}; "
-          f"табылды: {total}, көрсетілді: {len(hits)}")
+    print(f"Кезең (Алматы): {period}; табылды: {total}, көрсетілді: {len(hits)} [{mode}]")
     for h in hits:
-        print(fmt_hit(h.get("_source", {})))
+        print(fmt_hit(h))
 
 
 if __name__ == "__main__":
