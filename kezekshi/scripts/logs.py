@@ -47,18 +47,44 @@ SAFE_FIELDS = [
 SECRET_RE = re.compile(r'("?(password|token|authorization|secret|code)"?\s*[:=]\s*)("[^"]*"|\S+)', re.I)
 
 
+class Unavailable(Exception):
+    """Логтар көзі қолжетімсіз (туннель түскен / қосылу жоқ) — басқа көзге ауысуға болады."""
+
+
 def die(msg, code=1):
     print(msg, file=sys.stderr)
     sys.exit(code)
 
 
-def backend():
+def backends():
+    """Қолжетімді көздер, ретімен: алдымен сервис, сосын Kibana (Mac-та VPN қосулы болса)."""
+    found = []
     if os.environ.get("LOGS_SERVICE_URL") and os.environ.get("LOGS_SERVICE_TOKEN"):
-        return "service"
+        found.append("service")
     if os.environ.get("KIBANA_URL"):
-        return "kibana"
-    die("Логтарға жол берілмеген. Не LOGS_SERVICE_URL + LOGS_SERVICE_TOKEN (juz40-vpn-logs), "
-        "не KIBANA_URL (VPN қосулы болсын) керек.", 3)
+        found.append("kibana")
+    if not found:
+        die("Логтарға жол берілмеген. Не LOGS_SERVICE_URL + LOGS_SERVICE_TOKEN (juz40-vpn-logs), "
+            "не KIBANA_URL (VPN қосулы болсын) керек.", 3)
+    return found
+
+
+HINTS = {
+    "service": "Mac-та VPN қосулы болса, сервистің туннелі үзіледі (бір конфиг — бір қосылу): VPN-ды өшіріңіз.",
+    "kibana": "Kibana тек VPN арқылы ашылады: VPN қосулы ма?",
+}
+
+
+def with_fallback(fn):
+    """fn(mode)-ты бірінші қолжетімді көзбен орындайды; біреуі түссе — келесісіне ауысады."""
+    errors = []
+    for mode in backends():
+        try:
+            return mode, fn(mode)
+        except Unavailable as e:
+            errors.append(f"- {mode}: {e}. {HINTS[mode]}")
+            print(f"[{mode} қолжетімсіз, келесі көзге ауысамын]", file=sys.stderr)
+    die("Логтардың бірде-бір көзі қолжетімсіз:\n" + "\n".join(errors), 2)
 
 
 def ssl_context():
@@ -79,14 +105,14 @@ def http(method, url, headers, body=None):
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             die(f"Логтар рұқсат бермеді ({e.code}): токен/рұқсат керек — әзірлеушіге/DevOps-қа жүгініңіз.", 4)
-        if e.code in (502, 503):
-            die("Лог сервисі Elasticsearch-ке жете алмады (VPN туннелі түсіп қалған болуы мүмкін).", 2)
+        if e.code in (502, 503, 504):
+            raise Unavailable("лог сервисі Elasticsearch-ке жете алмады (туннель түскен болуы мүмкін)")
         die(f"Логтар қатесі {e.code}: {e.read()[:300]!r}", 1)
     except OSError as e:
         if "CERTIFICATE_VERIFY_FAILED" in str(e):
             die("SSL сертификаты тексерілмеді. Орнатыңыз: pip3 install certifi "
                 "(немесе /Applications/Python 3.x/Install Certificates.command).", 2)
-        die(f"Логтарға қосылу мүмкін болмады ({e}). VPN/сервис қолжетімді ме?", 2)
+        raise Unavailable(f"қосылу мүмкін болмады ({e})")
 
 
 # ---------- уақыт ----------
@@ -231,15 +257,17 @@ def main():
     p.add_argument("--count-users", action="store_true", help="қанша бөлек пайдаланушы (почталарсыз)")
     p.add_argument("--size", type=int, default=30)
     args = p.parse_args()
-    mode = backend()
 
     if args.check:
-        if mode == "service":
-            res = http("GET", os.environ["LOGS_SERVICE_URL"].rstrip("/") + "/health", {})
-            print(f"OK (juz40-vpn-logs): {json.dumps(res, ensure_ascii=False)[:200]}")
-        else:
+        def check(mode):
+            if mode == "service":
+                res = http("GET", os.environ["LOGS_SERVICE_URL"].rstrip("/") + "/health", {})
+                if isinstance(res, dict) and res.get("ok") is False:
+                    raise Unavailable(f"сервис жауап берді, бірақ ok=false: {json.dumps(res, ensure_ascii=False)[:200]}")
+                return f"OK (juz40-vpn-logs): {json.dumps(res, ensure_ascii=False)[:200]}"
             st = kibana_request("GET", "/api/status")
-            print(f'OK (Kibana): {st.get("name")} {st.get("version", {}).get("number")}')
+            return f'OK (Kibana): {st.get("name")} {st.get("version", {}).get("number")}'
+        print(with_fallback(check)[1])
         return
     if not (args.request_id or args.user or args.mapping or args.text):
         die("Кемінде біреуі керек: --request-id, --user, --mapping немесе --text")
@@ -247,7 +275,8 @@ def main():
         args.size = max(args.size, 500)
 
     start, end = time_range(args)
-    total, hits = (service_search if mode == "service" else kibana_search)(args, start, end)
+    mode, (total, hits) = with_fallback(
+        lambda m: (service_search if m == "service" else kibana_search)(args, start, end))
     period = f"{start.astimezone(ALMATY):%d.%m %H:%M} — {end.astimezone(ALMATY):%d.%m %H:%M}"
 
     if args.count_users:
