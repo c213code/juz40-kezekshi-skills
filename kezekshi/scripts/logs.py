@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -60,11 +61,20 @@ def backend():
         "не KIBANA_URL (VPN қосулы болсын) керек.", 3)
 
 
+def ssl_context():
+    # python.org-тың macOS нұсқасы жүйелік сертификаттарды көрмейді — бар болса certifi қолданамыз.
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def http(method, url, headers, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
@@ -73,6 +83,9 @@ def http(method, url, headers, body=None):
             die("Лог сервисі Elasticsearch-ке жете алмады (VPN туннелі түсіп қалған болуы мүмкін).", 2)
         die(f"Логтар қатесі {e.code}: {e.read()[:300]!r}", 1)
     except OSError as e:
+        if "CERTIFICATE_VERIFY_FAILED" in str(e):
+            die("SSL сертификаты тексерілмеді. Орнатыңыз: pip3 install certifi "
+                "(немесе /Applications/Python 3.x/Install Certificates.command).", 2)
         die(f"Логтарға қосылу мүмкін болмады ({e}). VPN/сервис қолжетімді ме?", 2)
 
 
